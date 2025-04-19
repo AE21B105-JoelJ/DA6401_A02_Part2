@@ -14,6 +14,7 @@ from lightning.pytorch.loggers import WandbLogger
 from torchmetrics import Precision
 from torchvision import datasets, transforms
 from sklearn.model_selection import train_test_split
+from torchmetrics import Accuracy
 import os
 
 # Function to give the activation function #
@@ -37,7 +38,7 @@ def return_activation_function(activation : str = "ReLU"):
 
 # Lightning module for fast training #
 class Lightning_CNN(L.LightningModule):
-    def __init__(self, model):
+    def __init__(self, model, lr=3e-4):
         super().__init__()
         self.save_hyperparameters(ignore = ['model'])
 
@@ -46,10 +47,9 @@ class Lightning_CNN(L.LightningModule):
 
         # Defining the loss and optimizers
         self.loss_fn = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.parameters(), lr = 5e-4)
 
         # Defining the metrics
-        self.prec_metric = Precision(task="multiclass", num_classes=10, average="weighted")
+        self.acc_metric = Accuracy(task="multiclass", num_classes=10, average="weighted")
 
     def forward(self, x):
         return self.model(x)
@@ -70,10 +70,10 @@ class Lightning_CNN(L.LightningModule):
         loss = self.loss_fn(output_, target_)
 
         output_pred = torch.argmax(output_, dim=1) 
-        precision = self.prec_metric(output_pred, target_)
+        acc = self.acc_metric(output_pred, target_)
         # Logging the metrics #
         self.log("val_loss", loss, prog_bar=True, logger=True, sync_dist=True)
-        self.log("val_acc", precision, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val_acc", acc, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -83,14 +83,22 @@ class Lightning_CNN(L.LightningModule):
         loss = self.loss_fn(output_, target_)
         
         output_pred = torch.argmax(output_, dim=1) 
-        precision = self.prec_metric(output_pred, target_)
+        acc= self.acc_metric(output_pred, target_)
         # Logging the metrics #
         self.log("test_loss", loss, prog_bar=True, logger=True, sync_dist=True)
-        self.log("test_acc", precision, prog_bar=True, logger=True, sync_dist=True)
+        self.log("test_acc", acc, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
     def configure_optimizers(self):
-        return self.optimizer
+        optimizer = torch.optim.AdamW(self.parameters(), lr = self.hparams.lr, weight_decay = 0.01)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.lr,
+            total_steps=self.trainer.estimated_stepping_batches,
+            pct_start=0.1,
+            anneal_strategy='cos'
+        )
+        return [optimizer], [scheduler]
 
 # class to orient (all images to landscape)
 class OrientReshape:
@@ -112,17 +120,20 @@ def create_data_augment_compose(input_size = (224, 224)):
     data_transforms = {
         "orient_" : transforms.Compose([
             OrientReshape(size=input_size),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            transforms.Normalize(mean = [0.485, 0.456, 0.406], std  = [0.229, 0.224, 0.225])
         ]),
         "train_" : transforms.Compose([
+            OrientReshape(size=input_size),
             transforms.RandomHorizontalFlip(p = 0.3),
             transforms.RandomVerticalFlip(p = 0.3),
             transforms.RandomRotation(degrees=15),
             transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
             transforms.GaussianBlur(kernel_size=3),
             transforms.ToTensor(),
+            transforms.Normalize(mean = [0.485, 0.456, 0.406], std  = [0.229, 0.224, 0.225]),
             transforms.RandomErasing(p = 0.2, scale=(0.02, 0.075)),
-        ])
+        ]),
     }
 
     return data_transforms
@@ -151,10 +162,6 @@ def create_dataloaders(batch_size, num_workers, train_dataset, val_dataset, is_d
     # Transforming the dataset with transforms
     if is_data_aug:
         train_dataset.dataset.transform = data_transforms['train_']
-    else:
-        train_dataset.dataset.transform = data_transforms['orient_']
-
-    val_dataset.dataset.transform = data_transforms['orient_']
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
@@ -165,9 +172,6 @@ def get_test_dataloader(path_, data_transforms):
     # Path to dataset #
     data_dir = path_ #os.path.join(os.path.abspath(""), "nature_12K/inaturalist_12K/val/")
     test_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms["orient_"])
-
-    # Applying transforms to datasets #
-    test_dataset.transform = data_transforms["orient_"] 
 
     batch_size = 20
     num_workers = 4 # Adaptive number of workers
